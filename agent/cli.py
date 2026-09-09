@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import time
 
 from agents import Runner, SQLiteSession
+from agents.items import ToolCallItem, ToolCallOutputItem
 from opentelemetry import trace
 
 from agent import db
@@ -57,7 +59,47 @@ def resolve_auth(role: str, user_id: int | None) -> AuthContext:
     return AuthContext(user_id=user.id, role=user.role, store_id=user.store_id)
 
 
-async def chat(ctx: AuthContext, model: str | None, defenses: bool = False) -> None:
+def _decode_json(value: object) -> object:
+    """Decode SDK JSON strings for the optional Homework 1 tool-call display."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def print_tool_calls(result: object) -> None:
+    """Print tool calls in a form that can be copied into ``hw1-session.jsonl``."""
+    calls: list[dict[str, object]] = []
+    calls_by_id: dict[str, dict[str, object]] = {}
+    pending_outputs: dict[str, object] = {}
+
+    for item in result.new_items:
+        if isinstance(item, ToolCallItem):
+            raw = item.raw_item
+            arguments = raw.get("arguments") if isinstance(raw, dict) else getattr(raw, "arguments", None)
+            call = {"name": item.tool_name, "arguments": _decode_json(arguments), "result": None}
+            calls.append(call)
+            if item.call_id is not None:
+                calls_by_id[str(item.call_id)] = call
+                if str(item.call_id) in pending_outputs:
+                    call["result"] = pending_outputs.pop(str(item.call_id))
+        elif isinstance(item, ToolCallOutputItem) and item.call_id is not None:
+            call_id = str(item.call_id)
+            output = _decode_json(item.output)
+            if call_id in calls_by_id:
+                calls_by_id[call_id]["result"] = output
+            else:
+                pending_outputs[call_id] = output
+
+    print("tool_calls>")
+    print(json.dumps(calls, indent=2, default=str))
+
+
+async def chat(
+    ctx: AuthContext, model: str | None, defenses: bool = False, show_tools: bool = False
+) -> None:
     agent = build_agent(ctx, model=model, defenses=defenses)
     session = SQLiteSession(
         f"cli-{ctx.role}-{ctx.user_id}-{int(time.time())}", str(SESSIONS_DB)
@@ -86,6 +128,9 @@ async def chat(ctx: AuthContext, model: str | None, defenses: bool = False) -> N
             result = await Runner.run(
                 agent, line, session=session, context=ctx, max_turns=MAX_TURNS
             )
+
+        if show_tools:
+            print_tool_calls(result)
 
         # ------------------------------------------------------------------
         # Module 4 pause and resume code (Homework 8, Part D). With defenses on,
@@ -142,13 +187,18 @@ def main() -> None:
         action="store_true",
         help="turn on the Module 4 guards and the refund approval pause (Homework 8)",
     )
+    parser.add_argument(
+        "--show-tools",
+        action="store_true",
+        help="print each tool call and result for Homework 1 session records",
+    )
     args = parser.parse_args()
 
     load_env()
     if args.trace:
         setup_tracing()
     ctx = resolve_auth(args.role, args.user)
-    asyncio.run(chat(ctx, args.model, defenses=args.defenses))
+    asyncio.run(chat(ctx, args.model, defenses=args.defenses, show_tools=args.show_tools))
 
 
 if __name__ == "__main__":
