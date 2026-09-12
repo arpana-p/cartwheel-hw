@@ -9,6 +9,11 @@ Usage:
     uv run python -m agent.cli --role support --user 9502 --trace
     uv run python -m agent.cli --role support --defenses   # Module 4 guards + refund pause
 
+Tracing is off by default. ``--trace`` uses the course's Langfuse setup;
+``--trace-openai`` opts into OpenAI hosted tracing (requires OPENAI_API_KEY
+and is unavailable for zero-data-retention organizations). Pick one destination.
+``--debug`` prints tool calls locally and works independently of tracing.
+
 The role picks a default demo user (shopper 1, merchant 9001, support 9501);
 --user overrides it. The auth context comes from the users table, exactly as
 the server would inject it. It is never taken from the chat itself.
@@ -27,15 +32,20 @@ import asyncio
 import json
 import time
 
-from agents import Runner, SQLiteSession
-from agents.items import ToolCallItem, ToolCallOutputItem
+try:  # readline transparently upgrades input(): arrow keys, ctrl-a/e/k/w,
+    import readline  # noqa: F401  # and up-arrow recall within this session
+except ImportError:  # Windows and slim builds ship without it
+    pass
+
+from agents import RunConfig, Runner, SQLiteSession
+from agents.items import RunItem
 from opentelemetry import trace
 
 from agent import db
-from agent.agent import build_agent, prompt_version, render_system_prompt
+from agent.agent import build_agent, prompt_version
 from agent.auth import AuthContext
 from agent.config import REPO_ROOT
-from observability.instrument import load_env, setup_tracing
+from observability.instrument import load_env, setup_openai_tracing, setup_tracing
 
 DEFAULT_USERS = {"shopper": 1, "merchant": 9001, "support": 9501}
 MAX_TURNS = 12  # cap runaway loops; keeps conversations bounded
@@ -43,13 +53,40 @@ SESSIONS_DB = REPO_ROOT / ".sessions.db"
 _tracer = trace.get_tracer("cartwheel.cli")
 
 
+def _print_tool_calls(new_items: list[RunItem]) -> None:
+    """Print each tool call and its result from one run's new items.
+
+    `Runner.run` always returns the tool calls and their outputs on
+    `result.new_items`, independent of whether tracing is configured, so
+    this is accurate with or without --trace.
+    """
+    outputs = {
+        item.call_id: item.output
+        for item in new_items
+        if item.type == "tool_call_output_item" and item.call_id is not None
+    }
+    for item in new_items:
+        if item.type == "tool_call_item":
+            raw = item.raw_item
+            args = (
+                raw.get("arguments")
+                if isinstance(raw, dict)
+                else getattr(raw, "arguments", None)
+            )
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    pass
+            print(f"  [tool] {item.tool_name}({args})")
+            if item.call_id in outputs:
+                print(f"    -> {outputs[item.call_id]}")
+
+
 def resolve_auth(role: str, user_id: int | None) -> AuthContext:
     """Build the auth context from the users table (the injected block)."""
-    conn = db.connect()
-    try:
+    with db.connection() as conn:
         user = db.get_user(conn, user_id if user_id is not None else DEFAULT_USERS[role])
-    finally:
-        conn.close()
     if user is None:
         raise SystemExit(f"no such user id: {user_id}")
     if user.role != role:
@@ -59,52 +96,20 @@ def resolve_auth(role: str, user_id: int | None) -> AuthContext:
     return AuthContext(user_id=user.id, role=user.role, store_id=user.store_id)
 
 
-def _decode_json(value: object) -> object:
-    """Decode SDK JSON strings for the optional Homework 1 tool-call display."""
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
-
-
-def print_tool_calls(result: object) -> None:
-    """Print tool calls in a form that can be copied into ``hw1-session.jsonl``."""
-    calls: list[dict[str, object]] = []
-    calls_by_id: dict[str, dict[str, object]] = {}
-    pending_outputs: dict[str, object] = {}
-
-    for item in result.new_items:
-        if isinstance(item, ToolCallItem):
-            raw = item.raw_item
-            arguments = raw.get("arguments") if isinstance(raw, dict) else getattr(raw, "arguments", None)
-            call = {"name": item.tool_name, "arguments": _decode_json(arguments), "result": None}
-            calls.append(call)
-            if item.call_id is not None:
-                calls_by_id[str(item.call_id)] = call
-                if str(item.call_id) in pending_outputs:
-                    call["result"] = pending_outputs.pop(str(item.call_id))
-        elif isinstance(item, ToolCallOutputItem) and item.call_id is not None:
-            call_id = str(item.call_id)
-            output = _decode_json(item.output)
-            if call_id in calls_by_id:
-                calls_by_id[call_id]["result"] = output
-            else:
-                pending_outputs[call_id] = output
-
-    print("tool_calls>")
-    print(json.dumps(calls, indent=2, default=str))
-
-
 async def chat(
-    ctx: AuthContext, model: str | None, defenses: bool = False, show_tools: bool = False
+    ctx: AuthContext,
+    model: str | None,
+    defenses: bool = False,
+    debug: bool = False,
+    tracing: bool = False,
 ) -> None:
     agent = build_agent(ctx, model=model, defenses=defenses)
+    # main() enables callbacks for Langfuse or explicit OpenAI tracing.
+    run_config = RunConfig(tracing_disabled=not tracing)
     session = SQLiteSession(
         f"cli-{ctx.role}-{ctx.user_id}-{int(time.time())}", str(SESSIONS_DB)
     )
-    version = prompt_version(render_system_prompt(ctx))
+    version = prompt_version()
     print(
         f"Cartwheel support CLI | role={ctx.role} user={ctx.user_id} "
         f"store={ctx.store_id} prompt_version={version} defenses={'on' if defenses else 'off'}"
@@ -126,11 +131,13 @@ async def chat(
                 span.set_attribute("cartwheel.user_id", str(ctx.user_id))
                 span.set_attribute("cartwheel.prompt_version", version)
             result = await Runner.run(
-                agent, line, session=session, context=ctx, max_turns=MAX_TURNS
+                agent,
+                line,
+                session=session,
+                context=ctx,
+                max_turns=MAX_TURNS,
+                run_config=run_config,
             )
-
-        if show_tools:
-            print_tool_calls(result)
 
         # ------------------------------------------------------------------
         # Module 4 pause and resume code (Homework 8, Part D). With defenses on,
@@ -151,7 +158,7 @@ async def chat(
         #       # pending call, including its JSON arguments.
         #       state.approve(item)                  # or state.reject(item)
         #   result = await Runner.run(agent, state, context=ctx,
-        #                             max_turns=MAX_TURNS)
+        #                             max_turns=MAX_TURNS, run_config=run_config)
         #
         # Loop until result.interruptions is empty (a resumed run can pause
         # again). Then fall through to printing final_output. Approving here
@@ -167,6 +174,8 @@ async def chat(
                 "See the seam comment above."
             )
 
+        if debug:
+            _print_tool_calls(result.new_items)
         print(f"\nagent> {result.final_output}\n")
 
 
@@ -179,8 +188,13 @@ def main() -> None:
         default=None,
         help="gpt-5.5 | claude-opus-4-6 | glm-5.2 (default: $CARTWHEEL_MODEL or gpt-5.5)",
     )
-    parser.add_argument(
+    tracing_options = parser.add_mutually_exclusive_group()
+    tracing_options.add_argument(
         "--trace", action="store_true", help="ship spans to Langfuse (Lecture 2)"
+    )
+    tracing_options.add_argument(
+        "--trace-openai", action="store_true",
+        help="send traces to OpenAI (unavailable for zero-data-retention organizations)",
     )
     parser.add_argument(
         "--defenses",
@@ -188,17 +202,25 @@ def main() -> None:
         help="turn on the Module 4 guards and the refund approval pause (Homework 8)",
     )
     parser.add_argument(
-        "--show-tools",
+        "--debug",
         action="store_true",
-        help="print each tool call and result for Homework 1 session records",
+        help="print each tool call's name, arguments, and result",
     )
     args = parser.parse_args()
 
     load_env()
+    tracing = False
     if args.trace:
-        setup_tracing()
+        tracing = setup_tracing()
+    elif args.trace_openai:
+        try:
+            tracing = setup_openai_tracing()
+        except ValueError as exc:
+            parser.error(str(exc))
     ctx = resolve_auth(args.role, args.user)
-    asyncio.run(chat(ctx, args.model, defenses=args.defenses, show_tools=args.show_tools))
+    asyncio.run(
+        chat(ctx, args.model, defenses=args.defenses, debug=args.debug, tracing=tracing)
+    )
 
 
 if __name__ == "__main__":
