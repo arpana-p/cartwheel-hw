@@ -1,0 +1,26 @@
+[
+  {
+    "trace_id": "9e9e98618d20de68276156c455e2dd75",
+    "permalink": "http://localhost:3000/project/cartwheel-dev/traces/9e9e98618d20de68276156c455e2dd75",
+    "prompt_version": "8e4cec5da99c",
+    "user_role": "support",
+    "user_id": "9501",
+    "tool_order": [
+      "search_help_center",
+      "search_help_center",
+      "get_policy"
+    ],
+    "final_status": "completed"
+  },
+  {
+    "trace_id": "2e3b17166203a871a82974c96272c401",
+    "permalink": "http://localhost:3000/project/cartwheel-dev/traces/2e3b17166203a871a82974c96272c401",
+    "prompt_version": "60584757cd7d",
+    "user_role": "support",
+    "user_id": "9501",
+    "tool_order": [
+      "search_help_center"
+    ],
+    "final_status": "completed"
+  }
+]

@@ -23,7 +23,6 @@
 
 services:
   langfuse-worker:
-    platform: linux/amd64
     image: langfuse/langfuse-worker:3
     restart: always
     depends_on: &langfuse-depends-on
